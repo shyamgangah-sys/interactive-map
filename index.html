@@ -3,10 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Uttar Pradesh — Product Coverage Map</title>
+  <title>India — Product Coverage Map</title>
 
   <!-- Leaflet CSS -->
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="./vendor/leaflet.css" />
 
   <style>
     /* ── RESET ─────────────────────────────────────────── */
@@ -208,6 +208,25 @@
       backdrop-filter: blur(4px); white-space: nowrap;
     }
     #mode-pill strong { color: #e2e8f0; }
+
+    /* ── MODE SWITCH / SUB-DISTRICT ─────────────────────── */
+    .mode-switch {
+      display: flex; gap: 3px; padding: 7px 18px;
+      border-bottom: 1px solid #1e293b; flex-shrink: 0;
+    }
+    .ms-btn {
+      flex: 1; padding: 6px 4px; border: 1px solid #334155;
+      border-radius: 6px; cursor: pointer; font-size: 10.5px;
+      font-weight: 600; text-align: center; transition: all .15s;
+      background: #1e293b; color: #64748b; outline: none;
+    }
+    .ms-btn:hover { background: #293548; color: #94a3b8; }
+    .ms-btn.on { background: #1e3a5f; color: #7dd3fc; border-color: #2563eb; }
+    .sb-info {
+      padding: 7px 18px 8px; font-size: 10.5px; color: #64748b;
+      border-bottom: 1px solid #1e293b; flex-shrink: 0; line-height: 1.6;
+    }
+    .sb-info span { color: #7dd3fc; font-weight: 500; }
   </style>
 </head>
 
@@ -221,7 +240,7 @@
       UP Coverage Tracker
       <span class="badge" id="dist-count">75 Districts</span>
     </h1>
-    <p>Uttar Pradesh — Product Reach Dashboard</p>
+    <p>India — Product Reach Dashboard</p>
   </div>
 
   <div class="sb-progress">
@@ -243,7 +262,12 @@
   </div>
 
   <div class="sb-search">
-    <input type="text" id="search" placeholder="&#128269;  Search districts…" autocomplete="off" />
+    <input type="text" id="search" placeholder="&#128269;  Search tehsils &amp; blocks…" autocomplete="off" />
+  </div>
+
+  <div id="sb-info-sub" class="sb-info">
+    Tehsil &amp; block boundaries from OpenStreetMap. Click any area to paint coverage.
+    <br><span id="sub-load-status"></span>
   </div>
 
   <div id="dist-list"></div>
@@ -251,7 +275,6 @@
   <div class="sb-foot">
     <button class="fb" id="btn-export" title="Export CSV">&#8659; CSV</button>
     <button class="fb" id="btn-towns" title="Load towns from OSM">&#127981; Towns</button>
-    <button class="fb" id="btn-2011" title="Load higher-detail boundaries (14 MB)">&#128249; HiRes</button>
     <button class="fb" id="btn-reset" title="Reset all">&#8635; Reset</button>
   </div>
 </div>
@@ -260,7 +283,7 @@
 <div id="map-wrap">
   <div id="loading">
     <div class="spin"></div>
-    <div class="lt">Loading Uttar Pradesh map…</div>
+    <div class="lt">Loading India map…</div>
     <div class="ls2" id="lsub">Fetching data from GitHub</div>
   </div>
 
@@ -284,10 +307,94 @@
 </div>
 
 <!-- Leaflet JS -->
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="./vendor/leaflet.js"></script>
 
 <script>
 'use strict';
+
+/* ═══════════════════════════════════════════════════════════
+   OSM → GEOJSON CONVERTER (inline, no external dependency)
+   Handles Overpass [out:json] + out geom; responses.
+   Stitches split way segments end-to-end into closed rings.
+═══════════════════════════════════════════════════════════ */
+
+function osmToGeoJSON(osm) {
+  function toXY(p) { return [p.lon, p.lat]; }
+
+  /* Join way segments that share endpoints into closed rings. */
+  function stitchRings(ways) {
+    if (!ways.length) return [];
+    const rings = [];
+    const pool  = ways.map(w => w.slice());
+
+    while (pool.length) {
+      let ring = pool.shift();
+      let budget = pool.length + 1;
+
+      while (budget-- > 0) {
+        const tail = ring[ring.length - 1];
+        const idx  = pool.findIndex(w =>
+          (w[0][0] === tail[0] && w[0][1] === tail[1]) ||
+          (w[w.length-1][0] === tail[0] && w[w.length-1][1] === tail[1])
+        );
+        if (idx === -1) break;
+        const seg  = pool.splice(idx, 1)[0];
+        const head = seg[0];
+        ring = ring.concat(
+          (head[0] === tail[0] && head[1] === tail[1]) ? seg.slice(1) : seg.slice(0, -1).reverse()
+        );
+        if (ring[0][0] === ring[ring.length-1][0] && ring[0][1] === ring[ring.length-1][1]) break;
+      }
+
+      /* Close if open. */
+      if (ring[0][0] !== ring[ring.length-1][0] || ring[0][1] !== ring[ring.length-1][1])
+        ring.push(ring[0]);
+
+      if (ring.length >= 4) rings.push(ring);
+    }
+    return rings;
+  }
+
+  const features = [];
+
+  for (const el of (osm.elements || [])) {
+    if (el.type === 'relation') {
+      const outerWays = [], innerWays = [];
+      for (const m of (el.members || [])) {
+        if (m.type === 'way' && m.geometry && m.geometry.length > 1) {
+          (m.role === 'inner' ? innerWays : outerWays).push(m.geometry.map(toXY));
+        }
+      }
+      const outers = stitchRings(outerWays);
+      const inners = stitchRings(innerWays);
+      if (!outers.length) continue;
+
+      features.push({
+        type: 'Feature',
+        id: 'relation/' + el.id,
+        properties: el.tags || {},
+        geometry: outers.length === 1
+          ? { type: 'Polygon',      coordinates: [outers[0], ...inners] }
+          : { type: 'MultiPolygon', coordinates: outers.map(o => [o, ...inners]) },
+      });
+
+    } else if (el.type === 'way' && el.geometry && el.geometry.length > 2) {
+      const coords = el.geometry.map(toXY);
+      if (coords[0][0] !== coords[coords.length-1][0] || coords[0][1] !== coords[coords.length-1][1])
+        coords.push(coords[0]);
+      if (coords.length < 4) continue;
+
+      features.push({
+        type: 'Feature',
+        id: 'way/' + el.id,
+        properties: el.tags || {},
+        geometry: { type: 'Polygon', coordinates: [coords] },
+      });
+    }
+  }
+
+  return { type: 'FeatureCollection', features };
+}
 
 /* ═══════════════════════════════════════════════════════════
    CONFIGURATION
@@ -303,10 +410,9 @@ const LEVELS = [
 ];
 
 /**
- * HindustanTimesLabs – verified 752 KB all-India GeoJSON.
- * state property: st_nm === "Uttar Pradesh"
+ * HindustanTimesLabs – all-India district boundaries (local copy).
  */
-const URL_FAST = 'https://raw.githubusercontent.com/HindustanTimesLabs/shapefiles/master/india/district/india_district.json';
+const URL_FAST = './data/india_district.json';
 
 /**
  * HindustanTimesLabs – 2011 census, higher-detail (~14 MB).
@@ -323,8 +429,14 @@ const OVERPASS_QUERY = `[out:json][timeout:60];
 node["place"~"^(city|town)$"](23.85,77.07,30.45,84.75);
 out body;`;
 
-const STATE_FILTER = 'Uttar Pradesh';
-const STORAGE_KEY  = 'up_cov_v3';
+const STORAGE_KEY     = 'in_cov_v1';
+const STORAGE_KEY_SUB = 'in_subcov_v1';
+
+/**
+ * Merged all-India assembly constituency boundaries (4,200 features, local).
+ * Properties: AC_NAME, AC_NO, DIST_NAME, ST_NAME, PC_NAME, ST_CODE, DT_CODE.
+ */
+const URL_SUB = './data/india_ac_all.json';
 
 /* ═══════════════════════════════════════════════════════════
    RUNTIME STATE
@@ -346,6 +458,13 @@ let paintLevel   = 1;          // currently selected level id
 let coverage  = {};
 let layers    = {};
 let names     = [];
+
+let subGeoLayer = null;   // Leaflet GeoJSON layer – tehsil/block polygons
+let subLoaded   = false;
+let coverageSub = {};     // subKey(name) → level id (0–4)
+let subNames    = [];
+let subLayers   = {};
+let activeMode  = 'subdistrict';   // 'district' | 'subdistrict'
 
 /* ═══════════════════════════════════════════════════════════
    HELPERS
@@ -373,8 +492,8 @@ function titleCase(s) {
 
 function initMap() {
   map = L.map('map', {
-    center: [26.5, 80.9],
-    zoom: 7,
+    center: [22, 82],
+    zoom: 5,
     zoomControl: false,
   });
 
@@ -415,14 +534,10 @@ async function loadDistricts(url, label) {
     return;
   }
 
-  /* Filter to Uttar Pradesh only */
-  const features = geojson.features.filter(f => {
-    const sn = (f.properties.st_nm || f.properties.ST_NM || '').trim();
-    return sn === STATE_FILTER;
-  });
+  const features = geojson.features;
 
   if (features.length === 0) {
-    setLSub('No UP features found – unexpected data format.');
+    setLSub('No features found – unexpected data format.');
     return;
   }
 
@@ -444,6 +559,10 @@ async function loadDistricts(url, label) {
 ═══════════════════════════════════════════════════════════ */
 
 function styleFor(feature) {
+  /* In sub-district mode, districts render as reference outlines only. */
+  if (activeMode === 'subdistrict') {
+    return { fillOpacity: 0, weight: 2, color: '#6b7280', opacity: 0.65 };
+  }
   const l = lvlOf(propName(feature.properties));
   return {
     fillColor:   LEVELS[l].color,
@@ -475,8 +594,9 @@ function renderDistricts(geojson) {
       layers[k] = layer;
       if (!names.includes(n)) names.push(n);
 
-      /* ── click: paint coverage level ── */
+      /* ── click: paint district coverage (district mode only) ── */
       layer.on('click', () => {
+        if (activeMode !== 'district') return;
         coverage[k] = paintLevel;
         layer.setStyle(styleFor(feature));
         saveData();
@@ -484,13 +604,15 @@ function renderDistricts(geojson) {
         renderList();
       });
 
-      /* ── hover ── */
+      /* ── hover (district mode only) ── */
       layer.on('mouseover', () => {
+        if (activeMode !== 'district') return;
         layer.setStyle(highlightStyle(feature));
         layer.bringToFront();
         showTooltip(titleCase(n), LEVELS[lvlOf(n)].name);
       });
       layer.on('mouseout', () => {
+        if (activeMode !== 'district') return;
         layer.setStyle(styleFor(feature));
         hideTooltip();
       });
@@ -579,6 +701,265 @@ function toggleTowns() {
 }
 
 /* ═══════════════════════════════════════════════════════════
+   SUB-DISTRICT (TEHSIL/BLOCK) — HELPERS
+═══════════════════════════════════════════════════════════ */
+
+/** Name extraction for HindustanTimesLabs AC sub-district features. */
+function subPropName(props) {
+  return (props.AC_NAME || props.CON_NAME || props['name:en'] || props.name || props.NAME || '').trim() || 'Unknown';
+}
+
+/** Storage key for sub-district entries (prefixed to avoid collisions with districts). */
+function subKey(n) { return 'sub_' + n.toLowerCase().trim(); }
+
+/** Coverage level for a sub-district name. */
+function subLvlOf(n) { return coverageSub[subKey(n)] ?? 0; }
+
+/** Persist sub-district coverage to localStorage. */
+function saveSub() {
+  try { localStorage.setItem(STORAGE_KEY_SUB, JSON.stringify(coverageSub)); } catch (_) {}
+}
+
+/**
+ * Style for a sub-district polygon.
+ * In sub-district mode: filled with coverage colour.
+ * In district mode: thin outline only (reference layer, non-interactive).
+ */
+function subStyleFor(feature) {
+  const l     = subLvlOf(subPropName(feature.properties));
+  const isSub = activeMode === 'subdistrict';
+  return {
+    fillColor:   LEVELS[l].color,
+    weight:      isSub ? 0.9 : 0.4,
+    color:       isSub ? '#374151' : '#9ca3af',
+    opacity:     isSub ? 0.9  : 0.55,
+    fillOpacity: isSub ? 0.75 : 0,
+  };
+}
+
+/** Highlight style for hover in sub-district mode. */
+function subHighlightStyle(feature) {
+  const l = subLvlOf(subPropName(feature.properties));
+  return { fillColor: LEVELS[l].color, weight: 2.5, color: '#1e293b', opacity: 1, fillOpacity: 0.9 };
+}
+
+/**
+ * Toggle CSS pointer-events on sub-district polygon SVG paths so they don't
+ * intercept mouse clicks when the user is in district mode.
+ */
+function setSubLayerInteractive(flag) {
+  if (!subGeoLayer) return;
+  subGeoLayer.eachLayer(l => {
+    if (l._path) l._path.style.pointerEvents = flag ? 'visiblePainted' : 'none';
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SUB-DISTRICT — RENDER LAYER
+═══════════════════════════════════════════════════════════ */
+
+function renderSubLayer(geojson) {
+  if (subGeoLayer) { map.removeLayer(subGeoLayer); subGeoLayer = null; }
+  subNames  = [];
+  subLayers = {};
+
+  subGeoLayer = L.geoJSON(geojson, {
+    style: subStyleFor,
+    onEachFeature(feature, layer) {
+      const n  = subPropName(feature.properties);
+      const sk = subKey(n);
+
+      subLayers[sk] = layer;
+      if (n !== 'Unknown' && !subNames.includes(n)) subNames.push(n);
+
+      layer.on('click', () => {
+        if (activeMode !== 'subdistrict') return;
+        coverageSub[sk] = paintLevel;
+        layer.setStyle(subStyleFor(feature));
+        saveSub();
+        updateStats();
+        renderSubList();
+      });
+
+      layer.on('mouseover', () => {
+        if (activeMode !== 'subdistrict') return;
+        layer.setStyle(subHighlightStyle(feature));
+        layer.bringToFront();
+        showTooltip(n, LEVELS[subLvlOf(n)].name);
+      });
+
+      layer.on('mouseout', () => {
+        if (activeMode !== 'subdistrict') return;
+        layer.setStyle(subStyleFor(feature));
+        hideTooltip();
+      });
+    },
+  }).addTo(map);
+
+  subNames.sort();
+  const countEl = document.getElementById('sub-count');
+  if (countEl) countEl.textContent = `(${subNames.length})`;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SUB-DISTRICT — LOAD FROM STATIC GEOJSON
+═══════════════════════════════════════════════════════════ */
+
+async function loadSubDistricts() {
+  if (subLoaded) return;
+  setLSub('Fetching UP constituency boundaries\u2026');
+  showLoading();
+
+  const statusEl = document.getElementById('sub-load-status');
+  if (statusEl) statusEl.textContent = 'Loading\u2026';
+
+  let geojson;
+  try {
+    const res = await fetch(URL_SUB);
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    geojson = await res.json();
+  } catch (err) {
+    hideLoading();
+    console.error('Sub-district load failed:', err);
+    if (statusEl) {
+      statusEl.innerHTML =
+        `\u274C ${err.message} \u2014 ` +
+        `<button onclick="subLoaded=false;document.getElementById('sub-load-status').textContent='';loadSubDistricts()" ` +
+        `style="color:#7dd3fc;background:none;border:none;cursor:pointer;font-size:10.5px;padding:0;text-decoration:underline">` +
+        `Retry</button>`;
+    }
+    toast('Could not load areas \u2014 click Retry in sidebar');
+    return;
+  }
+
+  if (!geojson.features || geojson.features.length === 0) {
+    hideLoading();
+    if (statusEl) statusEl.textContent = '\u274C No features found in data file';
+    toast('Area data file returned no features');
+    return;
+  }
+
+  renderSubLayer(geojson);
+  subLoaded = true;
+  hideLoading();
+
+  const n = subNames.length;
+  if (statusEl) statusEl.textContent = ` \u2714 ${n} areas loaded`;
+  toast(`Loaded ${n} UP constituencies`);
+
+  subGeoLayer.setStyle(subStyleFor);
+  subGeoLayer.bringToFront();
+  map.fitBounds(subGeoLayer.getBounds(), { padding: [16, 16] });
+  setSubLayerInteractive(true);
+  renderSubList();
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SUB-DISTRICT — MODE SWITCH
+═══════════════════════════════════════════════════════════ */
+
+async function setMode(mode) {
+  activeMode = mode;
+
+  document.getElementById('btn-mode-dist').classList.toggle('on', mode === 'district');
+  document.getElementById('btn-mode-sub').classList.toggle('on',  mode === 'subdistrict');
+
+  const infoEl = document.getElementById('sb-info-sub');
+  if (infoEl) infoEl.style.display = mode === 'subdistrict' ? 'block' : 'none';
+
+  document.getElementById('search').placeholder =
+    mode === 'subdistrict'
+      ? '\uD83D\uDD0D\u2002Search tehsils\u2026'
+      : '\uD83D\uDD0D\u2002Search districts\u2026';
+
+  if (mode === 'subdistrict') {
+    /* Show district boundaries as reference outlines only. */
+    if (distGeoLayer) distGeoLayer.setStyle(() => ({
+      fillOpacity: 0, weight: 2, color: '#6b7280', opacity: 0.65,
+    }));
+    /* Load sub-district data if not yet fetched. */
+    if (!subLoaded) {
+      await loadSubDistricts();
+    } else {
+      if (subGeoLayer) {
+        subGeoLayer.setStyle(subStyleFor);
+        subGeoLayer.bringToFront();
+      }
+      setSubLayerInteractive(true);
+    }
+  } else {
+    /* District mode: restore coverage fills and disable sub-district interactions. */
+    if (distGeoLayer) distGeoLayer.setStyle(styleFor);
+    if (subGeoLayer)  subGeoLayer.setStyle(subStyleFor);  /* thin outlines */
+    setSubLayerInteractive(false);
+  }
+
+  updateStats();
+  renderList();
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SUB-DISTRICT — SIDEBAR LIST
+═══════════════════════════════════════════════════════════ */
+
+function renderSubList() {
+  const query = document.getElementById('search').value.toLowerCase();
+  const c     = document.getElementById('dist-list');
+  c.innerHTML = '';
+
+  if (!subLoaded || subNames.length === 0) {
+    c.innerHTML =
+      '<div style="padding:18px 12px;text-align:center;color:#475569;font-size:11px;line-height:1.8">' +
+      'Sub-district data not yet loaded.<br>' +
+      '<span style="color:#7dd3fc">Click the Sub-Districts tab</span> to load tehsil &amp; block boundaries from OpenStreetMap.' +
+      '</div>';
+    return;
+  }
+
+  const filtered = subNames.filter(n => n.toLowerCase().includes(query));
+
+  if (filtered.length === 0 && query) {
+    c.innerHTML = '<div style="padding:14px;text-align:center;color:#475569;font-size:12px;">No match found</div>';
+    return;
+  }
+
+  filtered.forEach(n => {
+    const sk  = subKey(n);
+    const l   = LEVELS[subLvlOf(n)];
+    const div = document.createElement('div');
+    div.className = 'di';
+    div.innerHTML = `
+      <div class="dd" style="background:${l.color}"></div>
+      <div class="dn" style="font-size:11px">${n}</div>
+      <div class="ds">${l.short}</div>
+    `;
+
+    div.addEventListener('click', () => {
+      coverageSub[sk] = paintLevel;
+      if (subLayers[sk]) subLayers[sk].setStyle(subStyleFor(subLayers[sk].feature));
+      saveSub();
+      updateStats();
+      renderSubList();
+      if (subLayers[sk]) {
+        try { map.fitBounds(subLayers[sk].getBounds(), { padding: [60, 60], maxZoom: 13 }); } catch (_) {}
+      }
+    });
+
+    div.addEventListener('mouseenter', () => {
+      if (subLayers[sk]) {
+        subLayers[sk].setStyle(subHighlightStyle(subLayers[sk].feature));
+        subLayers[sk].bringToFront();
+      }
+    });
+    div.addEventListener('mouseleave', () => {
+      if (subLayers[sk]) subLayers[sk].setStyle(subStyleFor(subLayers[sk].feature));
+    });
+
+    c.appendChild(div);
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════
    UI — PAINT BUTTONS
 ═══════════════════════════════════════════════════════════ */
 
@@ -620,6 +1001,7 @@ function buildLegend() {
 ═══════════════════════════════════════════════════════════ */
 
 function renderList() {
+  if (activeMode === 'subdistrict') { renderSubList(); return; }
   const query = document.getElementById('search').value.toLowerCase();
   const c     = document.getElementById('dist-list');
   c.innerHTML = '';
@@ -672,12 +1054,22 @@ function renderList() {
 ═══════════════════════════════════════════════════════════ */
 
 function updateStats() {
-  const total = names.length;
-  if (!total) return;
+  const isSub = activeMode === 'subdistrict';
+  const pool  = isSub ? subNames : names;
+  const total = pool.length;
+
+  if (!total) {
+    ['pbar', 'pct', 's-touched', 's-estab', 's-full'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = id === 'pbar' ? '' : (id === 'pct' ? '0%' : '0');
+      if (id === 'pbar' && el) el.style.width = '0%';
+    });
+    return;
+  }
 
   let touched = 0, estab = 0, full = 0, weightedSum = 0;
-  names.forEach(n => {
-    const l = lvlOf(n);
+  pool.forEach(n => {
+    const l = isSub ? (coverageSub[subKey(n)] ?? 0) : lvlOf(n);
     if (l > 0) touched++;
     if (l >= 3) estab++;
     if (l === LEVELS.length - 1) full++;
@@ -692,6 +1084,8 @@ function updateStats() {
   document.getElementById('s-touched').textContent      = touched;
   document.getElementById('s-estab').textContent        = estab;
   document.getElementById('s-full').textContent         = full;
+  document.getElementById('dist-count').textContent     =
+    isSub ? `${total} Sub-Districts` : `${names.length} Districts`;
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -752,6 +1146,10 @@ function loadSavedData() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) coverage = JSON.parse(raw);
   } catch (_) { coverage = {}; }
+  try {
+    const raw2 = localStorage.getItem(STORAGE_KEY_SUB);
+    if (raw2) coverageSub = JSON.parse(raw2);
+  } catch (_) { coverageSub = {}; }
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -759,10 +1157,15 @@ function loadSavedData() {
 ═══════════════════════════════════════════════════════════ */
 
 function exportCSV() {
-  let csv = 'District,Coverage Level ID,Coverage Status\n';
+  let csv = 'Type,Name,Coverage Level ID,Coverage Status\n';
   names.forEach(n => {
     const l = lvlOf(n);
-    csv += `"${titleCase(n)}",${l},"${LEVELS[l].name}"\n`;
+    csv += `"District","${titleCase(n)}",${l},"${LEVELS[l].name}"\n`;
+  });
+  subNames.forEach(n => {
+    const sk = subKey(n);
+    const l  = coverageSub[sk] ?? 0;
+    csv += `"Sub-District","${n}",${l},"${LEVELS[l].name}"\n`;
   });
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
   const url  = URL.createObjectURL(blob);
@@ -781,13 +1184,19 @@ function exportCSV() {
 ═══════════════════════════════════════════════════════════ */
 
 function resetCoverage() {
-  if (!confirm('Reset all coverage data? This cannot be undone.')) return;
-  coverage = {};
+  if (!confirm('Reset ALL coverage data (districts + sub-districts)?\nThis cannot be undone.')) return;
+  coverage    = {};
+  coverageSub = {};
   names.forEach(n => {
     const k = key(n);
     if (layers[k]) layers[k].setStyle(styleFor(layers[k].feature));
   });
+  subNames.forEach(n => {
+    const sk = subKey(n);
+    if (subLayers[sk]) subLayers[sk].setStyle(subStyleFor(subLayers[sk].feature));
+  });
   localStorage.removeItem(STORAGE_KEY);
+  localStorage.removeItem(STORAGE_KEY_SUB);
   updateStats();
   renderList();
   toast('All coverage data has been reset');
@@ -802,19 +1211,6 @@ function wireButtons() {
   document.getElementById('btn-reset').addEventListener('click', resetCoverage);
   document.getElementById('btn-towns').addEventListener('click', toggleTowns);
 
-  document.getElementById('btn-2011').addEventListener('click', async () => {
-    if (hiResLoaded) { toast('High-res boundaries already loaded'); return; }
-    const ok = confirm(
-      'Load high-resolution 2011 census boundaries?\n\n' +
-      'This file is ~14 MB and may take several seconds on slower connections.'
-    );
-    if (!ok) return;
-    hiResLoaded = true;
-    await loadDistricts(URL_HIRES, '2011 Census Hi-Res');
-    document.getElementById('btn-2011').classList.add('on');
-    document.getElementById('btn-2011').textContent = '🖼 HiRes ✓';
-  });
-
   document.getElementById('search').addEventListener('input', renderList);
 }
 
@@ -828,7 +1224,8 @@ function boot() {
   buildPaintButtons();
   buildLegend();
   wireButtons();
-  loadDistricts(URL_FAST, 'Standard');
+  renderList();        // show initial "loading" message in sidebar
+  loadSubDistricts();  // fetch tehsil/block boundaries from Overpass API
 }
 
 boot();
